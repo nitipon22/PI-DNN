@@ -1,6 +1,6 @@
 # ================================
-# -1. Fix seed (ต้องตั้ง env ก่อน import tensorflow)
-#     แนะนำให้รันด้วย: PYTHONHASHSEED=42 python pi_dnn_battery_rul.py
+# -1. Fix seed
+#
 # ================================
 import os
 import random
@@ -33,20 +33,18 @@ def reset_seeds(seed=SEED):
     np.random.seed(seed)
     tf.random.set_seed(seed)
 
-
-# ตั้ง seed ทั้งหมดครั้งแรก
 reset_seeds(SEED)
 try:
-    keras.utils.set_random_seed(SEED)  # python + numpy + tf ในคำสั่งเดียว (TF >= 2.7)
+    keras.utils.set_random_seed(SEED)
 except Exception as e:
     print(f"[INFO] keras.utils.set_random_seed ใช้ไม่ได้: {e}")
 try:
-    tf.config.experimental.enable_op_determinism()  # TF >= 2.9
+    tf.config.experimental.enable_op_determinism()
 except Exception as e:
     print(f"[INFO] enable_op_determinism ใช้ไม่ได้: {e}")
 
 # ================================
-# 0. Output dir (ใช้เก็บรูป SHAP ท้ายสคริปต์)
+# 0. Output dir
 # ================================
 output_dir = "imgRevision/outputs/pi-dnn64"
 os.makedirs(output_dir, exist_ok=True)
@@ -62,7 +60,7 @@ df = pd.read_csv(
 print("First 5 records:", df.head())
 
 # ================================
-# 2. กำหนด features / target / group
+# 2.features / target / group
 # ================================
 features = [
     #'Cycle_Index',
@@ -89,7 +87,7 @@ y = df[target_col].copy()
 groups = df[group_col].copy()
 
 # ================================
-# 3. แทนค่าผิดปกติด้วย NaN
+# 3. NaN
 # ================================
 cols_must_be_positive = [c for c in
                           ['Discharge Time (s)', 'Charging time (s)', 'Total time (s)']
@@ -97,7 +95,6 @@ cols_must_be_positive = [c for c in
 
 
 def fit_outlier_bounds(X_train_df):
-    """คำนวณ IQR bounds จาก train fold เท่านั้น คืนค่า dict ของ (lower, upper) ต่อคอลัมน์"""
     bounds = {}
     for col in X_train_df.select_dtypes(include=[np.number]).columns:
         series = X_train_df[col]
@@ -109,7 +106,6 @@ def fit_outlier_bounds(X_train_df):
 
 
 def apply_outlier_bounds(X_df, bounds, cols_must_be_positive):
-    """ใช้ bounds ที่ fit จาก train fold มา mask ค่าผิดปกติเป็น NaN ให้กับ df ใดก็ได้ (train หรือ test)"""
     X_out = X_df.copy()
     for col in cols_must_be_positive:
         if col in X_out.columns:
@@ -121,7 +117,7 @@ def apply_outlier_bounds(X_df, bounds, cols_must_be_positive):
 
 
 # ================================
-# 4. KMeans-based imputation (fit เฉพาะ train fold)
+# 4. KMeans-based imputation
 # ================================
 def kmeans_impute_fit(X_train_df, n_clusters=5, random_state=SEED):
     X_train_filled_mean = X_train_df.fillna(X_train_df.mean())
@@ -167,14 +163,9 @@ def kmeans_impute_transform(X_df, kmeans, scaler_km, cluster_means, global_means
 
 
 # ================================
-# 5. safe_predict: กันเคส predict แล้วได้ NaN/Inf (โมเดล diverge)
+# 5. safe_predict
 # ================================
 def safe_predict(model, X_input, context_label=""):
-    """
-    predict แล้วเช็คว่ามี NaN/Inf โผล่มาไหม (เช่นตอน optimizer='sgd' แล้ว diverge)
-    คืนค่า (y_pred_flat, n_bad) โดย n_bad = จำนวนค่าที่เป็น NaN/Inf (ถูกแทนด้วย 0 ชั่วคราว
-    เพื่อไม่ให้ metric ทั้งก้อนพัง แต่ตัว flag n_bad จะถูกใช้ตัด combo นี้ทิ้งภายหลัง)
-    """
     y_pred = model.predict(X_input, verbose=0).flatten()
     bad_mask = ~np.isfinite(y_pred)
     n_bad = int(bad_mask.sum())
@@ -183,7 +174,6 @@ def safe_predict(model, X_input, context_label=""):
               f"(โมเดลน่าจะ diverge) -> จะตัด combo นี้ทิ้งจากการพิจารณา best_params")
         y_pred = np.nan_to_num(y_pred, nan=0.0, posinf=0.0, neginf=0.0)
     return y_pred, n_bad
-
 
 # ================================
 # 5b. Build Model Function
@@ -212,29 +202,37 @@ def build_model(optimizer='adam', learning_rate=0.001, neurons=64, input_shape=N
 
 # ================================
 # 5c. Physics-informed diagnostic metrics
-#     (evaluation-time only -- does NOT affect training, just measures how well
-#     the trained model respects the physics constraints on a given dataset)
+#     (evaluation-time only -- these metrics do not affect training.
+#      They measure how well the trained model satisfies the predefined
+#      physics-based monotonicity constraints on a given dataset.)
 #
 #     1) Monotonicity Violation Rate (MVR)
-#        สัดส่วนตัวอย่างที่ d(RUL_pred)/d(feature) มี "เครื่องหมายผิดตาม constraint":
-#          - Discharge Time (s): RUL ควรเพิ่มขึ้น (หรือเท่าเดิม) เมื่อค่านี้เพิ่ม
-#            -> gradient ที่ถูกต้องคือ >= 0 ; ถ้า gradient < 0 นับเป็น violation
-#          - Decrement 3.6-3.4V (s): RUL ควรเพิ่มขึ้น (หรือเท่าเดิม) เมื่อค่านี้เพิ่ม
-#            -> gradient ที่ถูกต้องคือ >= 0 ; ถ้า gradient < 0 นับเป็น violation
+#        Proportion of samples for which the gradient of the predicted RUL
+#        with respect to a constrained feature has the wrong sign:
+#
+#          - Discharge Time (s):
+#            RUL should increase or remain unchanged as Discharge Time increases.
+#            The expected gradient is therefore >= 0.
+#            A gradient < 0 is counted as a monotonicity violation.
+#
+#          - Decrement 3.6-3.4 V (s):
+#            RUL should increase or remain unchanged as this feature increases.
+#            The expected gradient is therefore >= 0.
+#            A gradient < 0 is counted as a monotonicity violation.
 #
 #     2) Gradient Consistency Score (GCS)
-#        สัดส่วนตัวอย่างที่ gradient "ถูกทิศทาง" ทั้งสอง feature พร้อมกัน
-#        (ยิ่งใกล้ 1 แปลว่าโมเดลเคารพ constraint สม่ำเสมอ; เป็นคนละมุมกับ MVR แบบ "any")
+#        Proportion of samples for which the gradients of both constrained
+#        features simultaneously satisfy their expected monotonic directions.
+#        A value closer to 1 indicates more consistent satisfaction of the
+#        monotonicity constraints.
 #
 #     3) Physically Implausible Predictions (PIP)
-#        สัดส่วน prediction ที่ผิดธรรมชาติทางฟิสิกส์ตรง ๆ (ไม่ต้องอาศัย gradient)
-#        เช่น RUL predicted < 0 (อายุการใช้งานคงเหลือติดลบไม่มีจริง)
+#        Proportion of predictions that are physically implausible based
+#        directly on the predicted RUL values, without using gradient information.
+#        For example, a predicted RUL < 0 is considered physically implausible
+#        because remaining useful life cannot be negative.
 # ================================
 def compute_gradient_metrics(model, X_scaled, idx_DT, idx_DEC, batch_size=256):
-    """
-    คำนวณ dRUL_pred/dx สำหรับทุกตัวอย่างใน X_scaled (หลัง scale แล้ว) ด้วย automatic
-    differentiation บนโมเดลที่เทรนเสร็จแล้ว (inference-time gradient, ไม่ได้เทรนเพิ่ม)
-    """
     X_tf = tf.convert_to_tensor(X_scaled, dtype=tf.float32)
     n = X_tf.shape[0]
     grad_DT_all = np.zeros(n, dtype=np.float32)
@@ -252,8 +250,7 @@ def compute_gradient_metrics(model, X_scaled, idx_DT, idx_DEC, batch_size=256):
         )
         grad_DT_all[start:end] = grads_np[:, idx_DT]
         grad_DEC_all[start:end] = grads_np[:, idx_DEC]
-
-    # ให้สอดคล้องกับ penalty ใน train_step(): ทั้งสอง feature ต้องมี gradient >= 0
+        
     mono_violation_DT = grad_DT_all < 0.0      # ควรเป็น >= 0
     mono_violation_DEC = grad_DEC_all < 0.0    # ควรเป็น >= 0
 
@@ -266,10 +263,6 @@ def compute_gradient_metrics(model, X_scaled, idx_DT, idx_DEC, batch_size=256):
 
 
 def compute_physics_informed_metrics(model, X_scaled, y_pred, idx_DT, idx_DEC, rul_lower_bound=0.0):
-    """
-    รวม 3 metric สำหรับวัดว่าโมเดล "physics-informed" จริงแค่ไหนบน dataset ที่ให้มา
-    (เรียกแยกสำหรับ train fold / test fold ก็ได้)
-    """
     grad_info = compute_gradient_metrics(model, X_scaled, idx_DT, idx_DEC)
 
     viol_DT = grad_info['mono_violation_DT']
@@ -345,14 +338,7 @@ def train_step(model, optimizer, X_batch, y_batch):
 
 
 def train_physics_informed(model, X, y, epochs=20, batch_size=8, seed=SEED):
-    """
-    ลูป training ที่เรียก train_step() จริง ๆ (ใช้ physics-informed / monotonicity loss
-    แทนการเรียก model.fit() แบบ mse เฉย ๆ)
-    คืนค่า diverged (bool) ถ้าเจอ loss เป็น NaN/Inf ระหว่างเทรน (ไว้ใช้ตัด combo ทิ้งเหมือนเดิม)
 
-    การ shuffle ใช้ np.random.RandomState(seed) ที่สร้างใหม่ทุกครั้งที่เรียกฟังก์ชันนี้
-    -> ทุก combo / ทุก fold ได้ลำดับ shuffle ชุดเดียวกันเสมอ (reproducible) และไม่ขึ้นกับเวอร์ชัน TF
-    """
     X_tf = tf.convert_to_tensor(X, dtype=tf.float32)
     y_tf = tf.convert_to_tensor(y, dtype=tf.float32)
     n = int(X_tf.shape[0])
@@ -428,16 +414,16 @@ for fold, (train_idx, test_idx) in enumerate(outer_gkf.split(X_raw, y, groups=gr
     y_test = y.iloc[test_idx].reset_index(drop=True)
     groups_train_full = groups.iloc[train_idx].reset_index(drop=True)
 
-    # ---- 8.1 Outlier bounds: fit บน train fold เท่านั้น แล้ว apply กับทั้ง train/test ----
+    # ---- 8.1 Outlier bounds ----
     outlier_bounds = fit_outlier_bounds(X_train_df)
     X_train_df = apply_outlier_bounds(X_train_df, outlier_bounds, cols_must_be_positive)
     X_test_df = apply_outlier_bounds(X_test_df, outlier_bounds, cols_must_be_positive)
 
-    # ---- 8.2 KMeans imputation: fit บน train fold เท่านั้น ----
+    # ---- 8.2 KMeans imputation ----
     X_train_imputed, km_model, km_scaler, cluster_means, global_means = kmeans_impute_fit(X_train_df)
     X_test_imputed = kmeans_impute_transform(X_test_df, km_model, km_scaler, cluster_means, global_means)
 
-    # ---- 8.3 แบ่ง train fold เป็น inner train/val ----
+    # ---- 8.3 Train fold (inner)----
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
     inner_train_idx, inner_val_idx = next(
         gss.split(X_train_imputed, y_train_full, groups=groups_train_full)
@@ -448,18 +434,18 @@ for fold, (train_idx, test_idx) in enumerate(outer_gkf.split(X_raw, y, groups=gr
     y_inner_train = y_train_full.iloc[inner_train_idx]
     y_inner_val = y_train_full.iloc[inner_val_idx]
 
-    # ---- 8.4 Scaler X fit เฉพาะ inner train ----
+    # ---- 8.4 Scaler X fit ----
     inner_scaler = StandardScaler()
     X_inner_train_scaled = inner_scaler.fit_transform(X_inner_train_df)
     X_inner_val_scaled = inner_scaler.transform(X_inner_val_df)
 
-    # y scaler (fit เฉพาะ inner train)
+    # y scaler
     y_scaler_inner = StandardScaler()
     y_inner_train_scaled = y_scaler_inner.fit_transform(
         y_inner_train.values.reshape(-1, 1)
     ).flatten()
 
-    # ---- 8.5 Grid search บน inner validation ----
+    # ---- 8.5 Grid search on inner validation ----
     best_val_mae = float('inf')
     best_params = None
     batch_size = 64
@@ -500,7 +486,7 @@ for fold, (train_idx, test_idx) in enumerate(outer_gkf.split(X_raw, y, groups=gr
 
     print(f"Fold {fold} best params (inner validation MAE={best_val_mae:.4f}): {best_params}")
 
-    # ---- 8.6 Retrain final model บน train fold ทั้งก้อน ----
+    # ---- 8.6 Retrain final model on train fold ----
     final_scaler = StandardScaler()
     X_train_scaled = final_scaler.fit_transform(X_train_imputed)
     X_test_scaled = final_scaler.transform(X_test_imputed)
@@ -524,7 +510,7 @@ for fold, (train_idx, test_idx) in enumerate(outer_gkf.split(X_raw, y, groups=gr
         print(f"[WARNING] Fold {fold}: final model diverged during physics-informed training "
               f"(params={best_params})")
 
-    # ---- 8.7 คำนวณ metrics ----
+    # ---- 8.7 metrics ----
     y_train_pred_scaled, n_bad_train = safe_predict(best_model, X_train_scaled, context_label=f"Fold {fold} train")
     y_train_pred = y_scaler_final.inverse_transform(y_train_pred_scaled.reshape(-1, 1)).flatten()
     train_mae = mean_absolute_error(y_train_full, y_train_pred)
@@ -598,7 +584,7 @@ for fold, (train_idx, test_idx) in enumerate(outer_gkf.split(X_raw, y, groups=gr
     last_fold_X_test_scaled = X_test_scaled
 
 # ================================
-# 9. สรุปผลลัพธ์ทุก fold
+# 9. Summary fold
 # ================================
 fold_results_df = pd.DataFrame(fold_results)
 print("\n===== Summary across folds =====")
